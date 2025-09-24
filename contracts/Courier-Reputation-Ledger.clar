@@ -12,15 +12,21 @@
 (define-constant ERR_DELIVERY_ALREADY_CONFIRMED (err u106))
 (define-constant ERR_DISPUTE_WINDOW_CLOSED (err u107))
 (define-constant ERR_INVALID_RATING (err u108))
+(define-constant ERR_BONUS_ALREADY_CLAIMED (err u109))
+(define-constant ERR_INSUFFICIENT_BONUS_POOL (err u110))
+(define-constant ERR_SCORE_TOO_LOW (err u111))
 
 (define-constant MINIMUM_STAKE u1000000)
 (define-constant DISPUTE_WINDOW_BLOCKS u144)
 (define-constant MAX_RATING u5)
 (define-constant MIN_RATING u1)
+(define-constant BONUS_THRESHOLD_SCORE u85)
+(define-constant BONUS_POOL_PERCENTAGE u5)
 
 (define-data-var next-delivery-id uint u1)
 (define-data-var total-couriers uint u0)
 (define-data-var total-deliveries uint u0)
+(define-data-var bonus-pool uint u0)
 
 (define-map couriers 
   principal 
@@ -33,7 +39,8 @@
     total-earnings: uint,
     stake-amount: uint,
     is-active: bool,
-    average-rating: uint
+    average-rating: uint,
+    last-bonus-block: uint
   }
 )
 
@@ -97,7 +104,8 @@
       total-earnings: u0,
       stake-amount: MINIMUM_STAKE,
       is-active: true,
-      average-rating: u0
+      average-rating: u0,
+      last-bonus-block: u0
     })
     
     (var-set total-couriers (+ (var-get total-couriers) u1))
@@ -117,7 +125,10 @@
     (asserts! (is-some (map-get? couriers courier)) ERR_COURIER_NOT_FOUND)
     (asserts! (> fee u0) ERR_INVALID_STATUS)
     
-    (try! (stx-transfer? fee caller (as-contract tx-sender)))
+    (let ((bonus-contribution (/ (* fee BONUS_POOL_PERCENTAGE) u100))
+          (remaining-fee (- fee bonus-contribution)))
+      (try! (stx-transfer? remaining-fee caller (as-contract tx-sender)))
+      (var-set bonus-pool (+ (var-get bonus-pool) bonus-contribution)))
     
     (map-set deliveries delivery-id {
       courier: courier,
@@ -204,7 +215,9 @@
         customer-rating: (some rating)
       }))
     
-    (try! (as-contract (stx-transfer? (get fee delivery) tx-sender courier-principal)))
+    (let ((bonus-contribution (/ (* (get fee delivery) BONUS_POOL_PERCENTAGE) u100))
+          (courier-fee (- (get fee delivery) bonus-contribution)))
+      (try! (as-contract (stx-transfer? courier-fee tx-sender courier-principal))))
     (try! (update-courier-stats courier-principal true rating))
     
     (ok true)
@@ -304,6 +317,30 @@
   )
 )
 
+(define-public (claim-bonus)
+  (let ((caller tx-sender)
+        (courier-data (unwrap! (map-get? couriers caller) ERR_COURIER_NOT_FOUND))
+        (courier-score (unwrap! (calculate-courier-score caller) ERR_COURIER_NOT_FOUND)))
+    
+    (asserts! (get is-active courier-data) ERR_UNAUTHORIZED)
+    (asserts! (>= courier-score BONUS_THRESHOLD_SCORE) ERR_SCORE_TOO_LOW)
+    (asserts! (> (var-get bonus-pool) u0) ERR_INSUFFICIENT_BONUS_POOL)
+    (asserts! (> (- stacks-block-height (get last-bonus-block courier-data)) u144) ERR_BONUS_ALREADY_CLAIMED)
+    
+    (let ((bonus-amount (calculate-bonus courier-score)))
+      (asserts! (>= (var-get bonus-pool) bonus-amount) ERR_INSUFFICIENT_BONUS_POOL)
+      
+      (try! (as-contract (stx-transfer? bonus-amount tx-sender caller)))
+      (var-set bonus-pool (- (var-get bonus-pool) bonus-amount))
+      
+      (map-set couriers caller 
+        (merge courier-data {last-bonus-block: stacks-block-height}))
+      
+      (ok bonus-amount)
+    )
+  )
+)
+
 (define-public (deactivate-courier)
   (let ((caller tx-sender)
         (courier-data (unwrap! (map-get? couriers caller) ERR_COURIER_NOT_FOUND)))
@@ -347,6 +384,14 @@
   )
 )
 
+(define-private (calculate-bonus (score uint))
+  (let ((base-bonus (/ (var-get bonus-pool) u10)))
+    (if (>= score u95)
+      (* base-bonus u3)
+      (if (>= score u90)
+        (* base-bonus u2)
+        base-bonus))))
+
 (define-read-only (get-courier-info (courier principal))
   (map-get? couriers courier)
 )
@@ -368,7 +413,30 @@
                      is-active: (get is-active courier-data)
                    }))
     ERR_COURIER_NOT_FOUND
+    )
+)
+
+(define-read-only (can-claim-bonus (courier principal))
+  (match (map-get? couriers courier)
+    courier-data (match (calculate-courier-score courier)
+                    score (ok {
+                      eligible: (and (get is-active courier-data)
+                                   (>= score BONUS_THRESHOLD_SCORE)
+                                   (> (var-get bonus-pool) u0)
+                                   (> (- stacks-block-height (get last-bonus-block courier-data)) u144)),
+                      score: score,
+                      bonus-amount: (calculate-bonus score),
+                      blocks-until-eligible: (if (> (- stacks-block-height (get last-bonus-block courier-data)) u144)
+                                               u0
+                                               (- u144 (- stacks-block-height (get last-bonus-block courier-data))))
+                    })
+                    err ERR_COURIER_NOT_FOUND)
+    ERR_COURIER_NOT_FOUND
   )
+)
+
+(define-read-only (get-bonus-pool)
+  (var-get bonus-pool)
 )
 
 (define-read-only (get-courier-delivery-ids (courier principal) (limit uint) (offset uint))
@@ -443,7 +511,8 @@
   (ok {
     total-couriers: (var-get total-couriers),
     total-deliveries: (var-get total-deliveries),
-    next-delivery-id: (var-get next-delivery-id)
+    next-delivery-id: (var-get next-delivery-id),
+    bonus-pool: (var-get bonus-pool)
   })
 )
 

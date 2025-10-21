@@ -15,6 +15,11 @@
 (define-constant ERR_BONUS_ALREADY_CLAIMED (err u109))
 (define-constant ERR_INSUFFICIENT_BONUS_POOL (err u110))
 (define-constant ERR_SCORE_TOO_LOW (err u111))
+(define-constant ERR_COMMITMENT_NOT_FOUND (err u112))
+(define-constant ERR_ALREADY_COMMITTED (err u113))
+(define-constant ERR_COMMITMENT_EXPIRED (err u114))
+(define-constant ERR_INVALID_TIME_WINDOW (err u115))
+(define-constant ERR_COMMITMENT_NOT_ELIGIBLE (err u116))
 
 (define-constant MINIMUM_STAKE u1000000)
 (define-constant DISPUTE_WINDOW_BLOCKS u144)
@@ -27,6 +32,7 @@
 (define-data-var total-couriers uint u0)
 (define-data-var total-deliveries uint u0)
 (define-data-var bonus-pool uint u0)
+(define-data-var next-commitment-id uint u1)
 
 (define-map couriers 
   principal 
@@ -85,6 +91,36 @@
     votes-against-courier: uint,
     is-resolved: bool,
     resolution: (optional bool)
+  }
+)
+
+(define-map time-commitments
+  uint
+  {
+    delivery-id: uint,
+    courier: principal,
+    promised-blocks: uint,
+    actual-blocks: (optional uint),
+    commitment-type: (string-ascii 20),
+    bonus-multiplier: uint,
+    is-fulfilled: bool,
+    is-claimed: bool,
+    created-block: uint
+  }
+)
+
+(define-map delivery-commitments
+  uint
+  { commitment-id: uint }
+)
+
+(define-map courier-commitment-stats
+  principal
+  {
+    total-commitments: uint,
+    fulfilled-commitments: uint,
+    total-bonus-earned: uint,
+    average-delivery-time: uint
   }
 )
 
@@ -552,5 +588,216 @@
                             (/ (* avg-rating u40) MAX_RATING))
                          u0)))
     ERR_COURIER_NOT_FOUND
+  )
+)
+
+(define-public (create-time-commitment
+  (delivery-id uint)
+  (promised-blocks uint)
+  (commitment-type (string-ascii 20)))
+  (let ((delivery (unwrap! (map-get? deliveries delivery-id) ERR_DELIVERY_NOT_FOUND))
+        (caller tx-sender)
+        (commitment-id (var-get next-commitment-id)))
+    
+    (asserts! (is-eq caller (get courier delivery)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status delivery) "accepted") ERR_INVALID_STATUS)
+    (asserts! (is-none (map-get? delivery-commitments delivery-id)) ERR_ALREADY_COMMITTED)
+    (asserts! (> promised-blocks u0) ERR_INVALID_TIME_WINDOW)
+    (asserts! (<= promised-blocks u1440) ERR_INVALID_TIME_WINDOW)
+    
+    (let ((bonus-multiplier (calculate-commitment-multiplier promised-blocks)))
+      (map-set time-commitments commitment-id {
+        delivery-id: delivery-id,
+        courier: caller,
+        promised-blocks: promised-blocks,
+        actual-blocks: none,
+        commitment-type: commitment-type,
+        bonus-multiplier: bonus-multiplier,
+        is-fulfilled: false,
+        is-claimed: false,
+        created-block: stacks-block-height
+      })
+      
+      (map-set delivery-commitments delivery-id { commitment-id: commitment-id })
+      
+      (let ((courier-stats (default-to
+                             { total-commitments: u0, fulfilled-commitments: u0, total-bonus-earned: u0, average-delivery-time: u0 }
+                             (map-get? courier-commitment-stats caller))))
+        (map-set courier-commitment-stats caller
+          (merge courier-stats { total-commitments: (+ (get total-commitments courier-stats) u1) })))
+      
+      (var-set next-commitment-id (+ commitment-id u1))
+      (ok commitment-id)
+    )
+  )
+)
+
+(define-public (finalize-commitment (delivery-id uint))
+  (let ((delivery (unwrap! (map-get? deliveries delivery-id) ERR_DELIVERY_NOT_FOUND))
+        (commitment-data (unwrap! (map-get? delivery-commitments delivery-id) ERR_COMMITMENT_NOT_FOUND))
+        (commitment-id (get commitment-id commitment-data))
+        (commitment (unwrap! (map-get? time-commitments commitment-id) ERR_COMMITMENT_NOT_FOUND))
+        (caller tx-sender))
+    
+    (asserts! (is-eq caller (get courier commitment)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status delivery) "confirmed") ERR_INVALID_STATUS)
+    (asserts! (not (get is-fulfilled commitment)) ERR_INVALID_STATUS)
+    
+    (let ((completed-block (unwrap! (get completed-block delivery) ERR_INVALID_STATUS))
+          (created-block (get created-block delivery))
+          (actual-time (- completed-block created-block))
+          (promised-blocks (get promised-blocks commitment))
+          (is-fulfilled (<= actual-time promised-blocks)))
+      
+      (map-set time-commitments commitment-id
+        (merge commitment {
+          actual-blocks: (some actual-time),
+          is-fulfilled: is-fulfilled
+        }))
+      
+      (let ((courier-stats (unwrap! (map-get? courier-commitment-stats caller) ERR_COURIER_NOT_FOUND))
+            (new-fulfilled (if is-fulfilled (+ (get fulfilled-commitments courier-stats) u1) (get fulfilled-commitments courier-stats)))
+            (total-comms (get total-commitments courier-stats))
+            (old-avg (get average-delivery-time courier-stats))
+            (new-avg (if (is-eq old-avg u0)
+                       actual-time
+                       (/ (+ (* old-avg (- total-comms u1)) actual-time) total-comms))))
+        
+        (map-set courier-commitment-stats caller
+          (merge courier-stats {
+            fulfilled-commitments: new-fulfilled,
+            average-delivery-time: new-avg
+          })))
+      
+      (ok is-fulfilled)
+    )
+  )
+)
+
+(define-public (claim-commitment-bonus (commitment-id uint))
+  (let ((commitment (unwrap! (map-get? time-commitments commitment-id) ERR_COMMITMENT_NOT_FOUND))
+        (caller tx-sender)
+        (delivery-id (get delivery-id commitment))
+        (delivery (unwrap! (map-get? deliveries delivery-id) ERR_DELIVERY_NOT_FOUND)))
+    
+    (asserts! (is-eq caller (get courier commitment)) ERR_UNAUTHORIZED)
+    (asserts! (get is-fulfilled commitment) ERR_COMMITMENT_NOT_ELIGIBLE)
+    (asserts! (not (get is-claimed commitment)) ERR_BONUS_ALREADY_CLAIMED)
+    (asserts! (is-eq (get status delivery) "confirmed") ERR_INVALID_STATUS)
+    
+    (let ((base-fee (get fee delivery))
+          (bonus-multiplier (get bonus-multiplier commitment))
+          (bonus-amount (/ (* base-fee bonus-multiplier) u100)))
+      
+      (asserts! (>= (var-get bonus-pool) bonus-amount) ERR_INSUFFICIENT_BONUS_POOL)
+      
+      (try! (as-contract (stx-transfer? bonus-amount tx-sender caller)))
+      (var-set bonus-pool (- (var-get bonus-pool) bonus-amount))
+      
+      (map-set time-commitments commitment-id
+        (merge commitment { is-claimed: true }))
+      
+      (let ((courier-stats (unwrap! (map-get? courier-commitment-stats caller) ERR_COURIER_NOT_FOUND)))
+        (map-set courier-commitment-stats caller
+          (merge courier-stats { total-bonus-earned: (+ (get total-bonus-earned courier-stats) bonus-amount) })))
+      
+      (ok bonus-amount)
+    )
+  )
+)
+
+(define-private (calculate-commitment-multiplier (promised-blocks uint))
+  (if (<= promised-blocks u72)
+    u20
+    (if (<= promised-blocks u144)
+      u15
+      (if (<= promised-blocks u288)
+        u10
+        u5)))
+)
+
+(define-read-only (get-commitment-info (commitment-id uint))
+  (map-get? time-commitments commitment-id)
+)
+
+(define-read-only (get-delivery-commitment (delivery-id uint))
+  (match (map-get? delivery-commitments delivery-id)
+    commitment-data (map-get? time-commitments (get commitment-id commitment-data))
+    none
+  )
+)
+
+(define-read-only (get-courier-commitment-stats (courier principal))
+  (map-get? courier-commitment-stats courier)
+)
+
+(define-read-only (calculate-commitment-fulfillment-rate (courier principal))
+  (match (map-get? courier-commitment-stats courier)
+    stats (let ((total (get total-commitments stats))
+                (fulfilled (get fulfilled-commitments stats)))
+            (ok {
+              total-commitments: total,
+              fulfilled-commitments: fulfilled,
+              fulfillment-rate: (if (> total u0)
+                                  (/ (* fulfilled u100) total)
+                                  u0),
+              average-delivery-time: (get average-delivery-time stats),
+              total-bonus-earned: (get total-bonus-earned stats)
+            }))
+    (ok {
+      total-commitments: u0,
+      fulfilled-commitments: u0,
+      fulfillment-rate: u0,
+      average-delivery-time: u0,
+      total-bonus-earned: u0
+    })
+  )
+)
+
+(define-read-only (estimate-commitment-bonus (delivery-id uint) (promised-blocks uint))
+  (match (map-get? deliveries delivery-id)
+    delivery (let ((base-fee (get fee delivery))
+                   (multiplier (calculate-commitment-multiplier promised-blocks))
+                   (estimated-bonus (/ (* base-fee multiplier) u100)))
+              (ok {
+                promised-blocks: promised-blocks,
+                bonus-multiplier: multiplier,
+                estimated-bonus: estimated-bonus,
+                base-fee: base-fee
+              }))
+    ERR_DELIVERY_NOT_FOUND
+  )
+)
+
+(define-read-only (can-create-commitment (delivery-id uint))
+  (match (map-get? deliveries delivery-id)
+    delivery (and (is-eq (get status delivery) "accepted")
+                  (is-none (map-get? delivery-commitments delivery-id)))
+    false
+  )
+)
+
+(define-read-only (get-commitment-performance (commitment-id uint))
+  (match (map-get? time-commitments commitment-id)
+    commitment (match (get actual-blocks commitment)
+                 actual (ok {
+                          promised-blocks: (get promised-blocks commitment),
+                          actual-blocks: actual,
+                          difference: (if (> actual (get promised-blocks commitment))
+                                       (- actual (get promised-blocks commitment))
+                                       u0),
+                          is-fulfilled: (get is-fulfilled commitment),
+                          performance-percentage: (if (> actual u0)
+                                                    (/ (* (get promised-blocks commitment) u100) actual)
+                                                    u0)
+                        })
+                 (ok {
+                      promised-blocks: (get promised-blocks commitment),
+                      actual-blocks: u0,
+                      difference: u0,
+                      is-fulfilled: false,
+                      performance-percentage: u0
+                    }))
+    ERR_COMMITMENT_NOT_FOUND
   )
 )
